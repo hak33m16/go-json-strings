@@ -16,125 +16,40 @@ import {
 	TextDocumentSyncKind,
 	InitializeResult,
 	DocumentDiagnosticReportKind,
-	type DocumentDiagnosticReport
+	type DocumentDiagnosticReport,
+	CodeActionKind,
+	CodeAction
 } from 'vscode-languageserver/node';
 
 import {
 	TextDocument
 } from 'vscode-languageserver-textdocument';
 
-// Create a connection for the server, using Node's IPC as a transport.
-// Also include all preview / proposed LSP features.
-const connection = createConnection(ProposedFeatures.all);
+const MAX_PROBLEMS = 100
+const SOURCE = 'go-json-strings'
 
-// Create a simple text document manager.
+const connection = createConnection(ProposedFeatures.all);
 const documents: TextDocuments<TextDocument> = new TextDocuments(TextDocument);
 
-let hasConfigurationCapability = false;
-let hasWorkspaceFolderCapability = false;
-let hasDiagnosticRelatedInformationCapability = false;
-
 connection.onInitialize((params: InitializeParams) => {
-	const capabilities = params.capabilities;
-
-	// Does the client support the `workspace/configuration` request?
-	// If not, we fall back using global settings.
-	hasConfigurationCapability = !!(
-		capabilities.workspace && !!capabilities.workspace.configuration
-	);
-	hasWorkspaceFolderCapability = !!(
-		capabilities.workspace && !!capabilities.workspace.workspaceFolders
-	);
-	hasDiagnosticRelatedInformationCapability = !!(
-		capabilities.textDocument &&
-		capabilities.textDocument.publishDiagnostics &&
-		capabilities.textDocument.publishDiagnostics.relatedInformation
-	);
 
 	const result: InitializeResult = {
 		capabilities: {
 			textDocumentSync: TextDocumentSyncKind.Incremental,
-			// Tell the client that this server supports code completion.
-			completionProvider: {
-				resolveProvider: true
-			},
 			diagnosticProvider: {
 				interFileDependencies: false,
 				workspaceDiagnostics: false
+			},
+			codeActionProvider: {
+				codeActionKinds: [CodeActionKind.QuickFix],
+				resolveProvider: false,
+				workDoneProgress: false
 			}
 		}
 	};
-	if (hasWorkspaceFolderCapability) {
-		result.capabilities.workspace = {
-			workspaceFolders: {
-				supported: true
-			}
-		};
-	}
+
 	return result;
 });
-
-connection.onInitialized(() => {
-	if (hasConfigurationCapability) {
-		// Register for all configuration changes.
-		connection.client.register(DidChangeConfigurationNotification.type, undefined);
-	}
-	if (hasWorkspaceFolderCapability) {
-		connection.workspace.onDidChangeWorkspaceFolders(_event => {
-			connection.console.log('Workspace folder change event received.');
-		});
-	}
-});
-
-// The example settings
-interface ExampleSettings {
-	maxNumberOfProblems: number;
-}
-
-// The global settings, used when the `workspace/configuration` request is not supported by the client.
-// Please note that this is not the case when using this server with the client provided in this example
-// but could happen with other clients.
-const defaultSettings: ExampleSettings = { maxNumberOfProblems: 1000 };
-let globalSettings: ExampleSettings = defaultSettings;
-
-// Cache the settings of all open documents
-const documentSettings: Map<string, Thenable<ExampleSettings>> = new Map();
-
-connection.onDidChangeConfiguration(change => {
-	if (hasConfigurationCapability) {
-		// Reset all cached document settings
-		documentSettings.clear();
-	} else {
-		globalSettings = <ExampleSettings>(
-			(change.settings.languageServerExample || defaultSettings)
-		);
-	}
-	// Refresh the diagnostics since the `maxNumberOfProblems` could have changed.
-	// We could optimize things here and re-fetch the setting first can compare it
-	// to the existing setting, but this is out of scope for this example.
-	connection.languages.diagnostics.refresh();
-});
-
-function getDocumentSettings(resource: string): Thenable<ExampleSettings> {
-	if (!hasConfigurationCapability) {
-		return Promise.resolve(globalSettings);
-	}
-	let result = documentSettings.get(resource);
-	if (!result) {
-		result = connection.workspace.getConfiguration({
-			scopeUri: resource,
-			section: 'languageServerExample'
-		});
-		documentSettings.set(resource, result);
-	}
-	return result;
-}
-
-// Only keep settings for open documents
-documents.onDidClose(e => {
-	documentSettings.delete(e.document.uri);
-});
-
 
 connection.languages.diagnostics.on(async (params) => {
 	const document = documents.get(params.textDocument.uri);
@@ -153,97 +68,117 @@ connection.languages.diagnostics.on(async (params) => {
 	}
 });
 
-// The content of a text document has changed. This event is emitted
-// when the text document first opened or when its content has changed.
-documents.onDidChangeContent(change => {
-	validateTextDocument(change.document);
-});
-
-async function validateTextDocument(textDocument: TextDocument): Promise<Diagnostic[]> {
-	// In this simple example we get the settings for every validate run.
-	const settings = await getDocumentSettings(textDocument.uri);
-
-	// The validator creates diagnostics for all uppercase words length 2 and more
-	const text = textDocument.getText();
-	const pattern = /\b[A-Z]{2,}\b/g;
-	let m: RegExpExecArray | null;
-
-	let problems = 0;
-	const diagnostics: Diagnostic[] = [];
-	while ((m = pattern.exec(text)) && problems < settings.maxNumberOfProblems) {
-		problems++;
-		const diagnostic: Diagnostic = {
-			severity: DiagnosticSeverity.Warning,
-			range: {
-				start: textDocument.positionAt(m.index),
-				end: textDocument.positionAt(m.index + m[0].length)
-			},
-			message: `${m[0]} is all uppercase.`,
-			source: 'ex'
-		};
-		if (hasDiagnosticRelatedInformationCapability) {
-			diagnostic.relatedInformation = [
-				{
-					location: {
-						uri: textDocument.uri,
-						range: Object.assign({}, diagnostic.range)
-					},
-					message: 'Spelling matters'
-				},
-				{
-					location: {
-						uri: textDocument.uri,
-						range: Object.assign({}, diagnostic.range)
-					},
-					message: 'Particularly for names'
-				}
-			];
-		}
-		diagnostics.push(diagnostic);
+connection.onCodeAction(handler => {
+	if (DIAGNOSTIC_CODE_ACTIONS[handler.textDocument.uri] === undefined) {
+		return
 	}
-	return diagnostics;
+
+	for (const item of handler.context.diagnostics) {
+		if (item.source === SOURCE && item.data?.id) {
+			return [DIAGNOSTIC_CODE_ACTIONS[handler.textDocument.uri][item.data?.id]]
+		}
+	}
+})
+
+interface DocumentMap {
+	[key: string]: ActionMap
 }
 
-connection.onDidChangeWatchedFiles(_change => {
-	// Monitored files have change in VSCode
-	connection.console.log('We received a file change event');
-});
+interface ActionMap {
+	[key: string]: CodeAction
+}
 
-// This handler provides the initial list of the completion items.
-connection.onCompletion(
-	(_textDocumentPosition: TextDocumentPositionParams): CompletionItem[] => {
-		// The pass parameter contains the position of the text document in
-		// which code complete got requested. For the example we ignore this
-		// info and always provide the same completion items.
-		return [
-			{
-				label: 'TypeScript',
-				kind: CompletionItemKind.Text,
-				data: 1
-			},
-			{
-				label: 'JavaScript',
-				kind: CompletionItemKind.Text,
-				data: 2
+const DIAGNOSTIC_CODE_ACTIONS: DocumentMap = {}
+
+async function validateTextDocument(textDocument: TextDocument): Promise<Diagnostic[]> {
+	DIAGNOSTIC_CODE_ACTIONS[textDocument.uri] = {}
+
+	const text = textDocument.getText();
+
+	const firstLineBreakPos = text.indexOf('\n')
+	const lineEnding = text[firstLineBreakPos - 1] === '\r' ? '\r\n' : '\n'
+
+	const pattern = "// @json";
+	const multilineCommentDelimiter = '`'
+	
+	let problems = 0;
+	const diagnostics: Diagnostic[] = []
+	let currentJSONStringPos = text.indexOf(pattern);
+	while (currentJSONStringPos !== -1 && problems < MAX_PROBLEMS) {
+		const start = text.indexOf(multilineCommentDelimiter, currentJSONStringPos) + 1
+		let cursor = start
+		while (text[cursor] != multilineCommentDelimiter) {
+			if (text[cursor] === undefined) {
+				return diagnostics
 			}
-		];
-	}
-);
 
-// This handler resolves additional information for the item selected in
-// the completion list.
-connection.onCompletionResolve(
-	(item: CompletionItem): CompletionItem => {
-		if (item.data === 1) {
-			item.detail = 'TypeScript details';
-			item.documentation = 'TypeScript documentation';
-		} else if (item.data === 2) {
-			item.detail = 'JavaScript details';
-			item.documentation = 'JavaScript documentation';
+			++cursor
 		}
-		return item;
+		
+		const JSONString = text.substring(start, cursor)
+		let parsedJSON
+		try {
+			parsedJSON = JSON.parse(JSONString)
+
+			const expectedJSONFormat = lineEnding + JSON.stringify(parsedJSON, null, '\t').replace(/\n/g, lineEnding) + lineEnding
+			if (JSONString != expectedJSONFormat) {
+				++problems
+
+				const id = 'format-pos-' + currentJSONStringPos.toString()
+
+				const diagnostic: Diagnostic = {
+					severity: DiagnosticSeverity.Warning,
+					range: {
+						start: textDocument.positionAt(currentJSONStringPos),
+						end: textDocument.positionAt(cursor),
+					},
+					message: `JSON string not formatted as expected`,
+					source: SOURCE,
+					data: {
+						id: id
+					}
+				}
+				diagnostics.push(diagnostic)
+
+				DIAGNOSTIC_CODE_ACTIONS[textDocument.uri][id] = {
+					title: 'Format JSON string',
+					isPreferred: true,
+					kind: CodeActionKind.QuickFix,
+					edit: {
+						changes: {
+							[textDocument.uri]: [
+								{
+									newText: expectedJSONFormat,
+									range: {
+										start: textDocument.positionAt(start),
+										end: textDocument.positionAt(cursor)
+									}
+								}
+							]
+						}
+					}
+				}
+			}
+		} catch (e) {
+			++problems
+
+			const diagnostic: Diagnostic = {
+				severity: DiagnosticSeverity.Error,
+				range: {
+					start: textDocument.positionAt(currentJSONStringPos),
+					end: textDocument.positionAt(cursor),
+				},
+				message: `Failed to parse this string as JSON with error:\n ${e}`,
+				source: SOURCE,
+			}
+			diagnostics.push(diagnostic)
+		}
+
+		currentJSONStringPos = text.indexOf(pattern, cursor + 1)
 	}
-);
+
+	return diagnostics
+}
 
 // Make the text document manager listen on the connection
 // for open, change and close text document events
